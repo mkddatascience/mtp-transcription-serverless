@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-HF_TOKEN = os.getenv("HF_TOKEN") or "hf...."
+HF_TOKEN = os.getenv("HF_TOKEN") or ".."
 
 MODELS = [
     "Qwen/Qwen3-ASR-1.7B",

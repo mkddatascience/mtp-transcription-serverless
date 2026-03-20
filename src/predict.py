@@ -21,6 +21,7 @@ FORCED_ALIGNER = os.getenv("FORCED_ALIGNER", "Qwen/Qwen3-ForcedAligner-0.6B")
 HF_TOKEN       = os.getenv("HF_TOKEN", "HF_TOKEN_HERE")
 
 SEGMENT_GAP_THRESHOLD = 1.0
+MIN_DIARIZATION_SECONDS = 10
 
 
 class Predictor:
@@ -39,7 +40,7 @@ class Predictor:
         # ── Load Qwen3-ASR ─────────────────────────────────────────────────
         print(f"Loading Qwen3-ASR model: {MODEL_NAME} on {self.device}")
         model_load_start = time.time()
-        
+
         self.model = Qwen3ASRModel.from_pretrained(
             MODEL_NAME,
             dtype=torch.bfloat16,
@@ -74,7 +75,7 @@ class Predictor:
             print("Speaker diarization disabled by configuration.")
         else:
             print("No HF_TOKEN found. Speaker diarization disabled.")
-        
+
         total_setup_time = time.time() - setup_start
         print(f"Total setup time: {total_setup_time:.2f}s")
 
@@ -94,11 +95,12 @@ class Predictor:
 
         Returns:
             List of dicts with: detected_language, transcription,
-                                time_stamps, segments
+                                time_stamps, segments, diarization_skipped,
+                                diarization_skip_reason
         """
         predict_start = time.time()
         timing_breakdown = {}
-        
+
         prep_start = time.time()
         if isinstance(audio, str):
             audio = [audio]
@@ -113,7 +115,7 @@ class Predictor:
 
         print(f"Transcribing {len(audio)} file(s) with Qwen3-ASR...")
         transcribe_start = time.time()
-        
+
         results = self.model.transcribe(
             audio=audio,
             language=language_list,
@@ -124,10 +126,10 @@ class Predictor:
 
         outputs = []
         print(f"Results: {results}")
-        
+
         for idx, (audio_path, r) in enumerate(zip(audio, results)):
             segment_start = time.time()
-            
+
             grouping_start = time.time()
             segments = _group_words_into_segments(
                 words=r.time_stamps.items if r.time_stamps else [],
@@ -135,31 +137,52 @@ class Predictor:
             )
             timing_breakdown[f'file_{idx}_word_grouping'] = time.time() - grouping_start
 
+            diarization_skipped = False
+            diarization_skip_reason = None
+
             if enable_diarization and self.diarization_pipeline is not None:
-                diarize_start = time.time()
-                segments = self._apply_diarization(
-                    audio_path=audio_path,
-                    segments=segments,
-                    num_speakers=num_speakers,
-                    min_speakers=min_speakers,
-                    max_speakers=max_speakers,
-                )
-                timing_breakdown[f'file_{idx}_diarization'] = time.time() - diarize_start
-                print(f"Diarization for file {idx} completed in {timing_breakdown[f'file_{idx}_diarization']:.2f}s")
+                # Validate audio before attempting diarization
+                is_valid, reason = _validate_audio_for_diarization(audio_path)
+
+                if not is_valid:
+                    diarization_skipped = True
+                    diarization_skip_reason = reason
+                    print(f"Diarization skipped for file {idx}: {reason}")
+                    # Mark all segments as UNKNOWN speaker
+                    for segment in segments:
+                        segment["speaker"] = "UNKNOWN"
+                else:
+                    diarize_start = time.time()
+                    segments, diarization_skipped, diarization_skip_reason = self._apply_diarization(
+                        audio_path=audio_path,
+                        segments=segments,
+                        num_speakers=num_speakers,
+                        min_speakers=min_speakers,
+                        max_speakers=max_speakers,
+                    )
+                    timing_breakdown[f'file_{idx}_diarization'] = time.time() - diarize_start
+                    print(f"Diarization for file {idx} completed in {timing_breakdown[f'file_{idx}_diarization']:.2f}s")
+            elif enable_diarization and self.diarization_pipeline is None:
+                diarization_skipped = True
+                diarization_skip_reason = "Diarization pipeline not loaded (missing HF_TOKEN or load failed)"
+                for segment in segments:
+                    segment["speaker"] = "UNKNOWN"
 
             serialize_start = time.time()
             outputs.append({
-                "detected_language": r.language,
-                "transcription":     r.text,
-                "time_stamps":       _serialize_timestamps(r.time_stamps) if return_time_stamps else None,
-                "segments":          segments,
+                "detected_language":       r.language,
+                "transcription":           r.text,
+                "time_stamps":             _serialize_timestamps(r.time_stamps) if return_time_stamps else None,
+                "segments":                segments,
+                "diarization_skipped":     diarization_skipped,
+                "diarization_skip_reason": diarization_skip_reason,
             })
             timing_breakdown[f'file_{idx}_serialization'] = time.time() - serialize_start
             timing_breakdown[f'file_{idx}_total'] = time.time() - segment_start
 
         total_time = time.time() - predict_start
         timing_breakdown['total_predict_time'] = total_time
-        
+
         print("\n" + "="*60)
         print("TIMING BREAKDOWN:")
         print("="*60)
@@ -180,6 +203,9 @@ class Predictor:
         """
         Run pyannote diarization and assign speaker labels to each segment
         using maximum temporal overlap.
+
+        Returns:
+            (segments, diarization_skipped, diarization_skip_reason)
         """
         print(f"Running speaker diarization on: {audio_path}")
         diarize_timing = {}
@@ -195,31 +221,91 @@ class Predictor:
                 diarize_kwargs["max_speakers"] = max_speakers
         diarize_timing['kwargs_prep'] = time.time() - kwargs_start
 
-        pipeline_start = time.time()
-        diarization = self.diarization_pipeline(audio_path, **diarize_kwargs)
-        diarize_timing['pipeline_execution'] = time.time() - pipeline_start
-        print(f"  Pipeline execution: {diarize_timing['pipeline_execution']:.2f}s")
+        try:
+            pipeline_start = time.time()
+            diarization = self.diarization_pipeline(audio_path, **diarize_kwargs)
+            diarize_timing['pipeline_execution'] = time.time() - pipeline_start
+            print(f"  Pipeline execution: {diarize_timing['pipeline_execution']:.2f}s")
 
-        extract_start = time.time()
-        diarization_turns = [
-            (turn.start, turn.end, speaker)
-            for turn, _, speaker
-            in diarization.speaker_diarization.itertracks(yield_label=True)
-        ]
-        diarize_timing['extract_turns'] = time.time() - extract_start
+            extract_start = time.time()
+            diarization_turns = [
+                (turn.start, turn.end, speaker)
+                for turn, _, speaker
+                in diarization.speaker_diarization.itertracks(yield_label=True)
+            ]
+            diarize_timing['extract_turns'] = time.time() - extract_start
 
-        assign_start = time.time()
-        for segment in segments:
-            segment["speaker"] = _assign_speaker(
-                segment["start"], segment["end"], diarization_turns
-            )
-        diarize_timing['assign_speakers'] = time.time() - assign_start
+            assign_start = time.time()
+            for segment in segments:
+                segment["speaker"] = _assign_speaker(
+                    segment["start"], segment["end"], diarization_turns
+                )
+            diarize_timing['assign_speakers'] = time.time() - assign_start
 
-        print(f"  Diarization timing breakdown:")
-        for key, value in diarize_timing.items():
-            print(f"    {key}: {value:.3f}s")
+            print(f"  Diarization timing breakdown:")
+            for key, value in diarize_timing.items():
+                print(f"    {key}: {value:.3f}s")
 
-        return segments
+            return segments, False, None
+
+        except Exception as e:
+            reason = f"Diarization failed during pipeline execution: {str(e)}"
+            print(f"  ERROR: {reason}")
+            for segment in segments:
+                segment["speaker"] = "UNKNOWN"
+            return segments, True, reason
+
+
+# ── Audio validation ───────────────────────────────────────────────────────
+
+def _validate_audio_for_diarization(audio_path: str):
+    """
+    Validate audio file is suitable for pyannote diarization.
+
+    Returns:
+        (is_valid: bool, reason: str or None)
+        reason is None if valid, otherwise a human-readable explanation.
+    """
+    import soundfile as sf
+
+    # Check file exists
+    if not os.path.exists(audio_path):
+        return False, f"Audio file does not exist: {audio_path}"
+
+    # Check file is not empty
+    if os.path.getsize(audio_path) == 0:
+        return False, "Audio file is empty (0 bytes)"
+
+    # Check file is readable and get duration
+    try:
+        info = sf.info(audio_path)
+    except Exception as e:
+        return False, f"Audio file is unreadable or corrupted: {str(e)}"
+
+    # Check sample rate
+    if info.samplerate != 48000:
+        return False, (
+            f"Audio sample rate is {info.samplerate}Hz, expected 48000Hz. "
+            f"Normalization may have failed."
+        )
+
+    # Check duration
+    duration_seconds = info.frames / info.samplerate
+    if duration_seconds < MIN_DIARIZATION_SECONDS:
+        return False, (
+            f"Audio duration is {duration_seconds:.2f}s, minimum required for "
+            f"diarization is {MIN_DIARIZATION_SECONDS}s."
+        )
+
+    # Check sample count matches what pyannote expects for first chunk
+    expected_samples = info.samplerate * MIN_DIARIZATION_SECONDS  # 480000
+    if info.frames < expected_samples:
+        return False, (
+            f"Audio has {info.frames} samples, pyannote requires at least "
+            f"{expected_samples} samples ({MIN_DIARIZATION_SECONDS}s at {info.samplerate}Hz)."
+        )
+
+    return True, None
 
 
 # ── Word grouping ──────────────────────────────────────────────────────────
@@ -313,6 +399,7 @@ def write_srt(segments):
         result += f"[{speaker}] {seg['text'].strip().replace('-->', '->')}\n\n"
     return result
 
+
 def _serialize_timestamps(time_stamps):
     """Convert ForcedAlignResult to JSON serializable format."""
     if time_stamps is None:
@@ -320,9 +407,9 @@ def _serialize_timestamps(time_stamps):
     try:
         return [
             {
-                "text": item.text,
+                "text":  item.text,
                 "start": item.start_time,
-                "end": item.end_time,
+                "end":   item.end_time,
             }
             for item in time_stamps.items
         ]
